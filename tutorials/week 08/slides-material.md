@@ -179,7 +179,7 @@ Normalize process reward and add outcome reward
                 `--> update rubricator
 ```
 
-![RLCER_TRAIN_BATCH workflow diagram](./.meta/RLCER_TRAIN_BATCH.png)
+![RLCER_TRAIN_BATCH workflow diagram](/.meta/RLCER_TRAIN_BATCH.png)
 
 **Where this is discussed:**
 - Report: `deep-research-report.md` -> `## Paper summaries, examples, and pseudocode` (RLCER block)
