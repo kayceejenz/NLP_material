@@ -109,15 +109,77 @@ Web-verified source links:
 6. Update reasoner and rubricator objectives.
 
 ```text
-for question in batch:
-  rollouts = sample_reasoner(question, N)
-  rubrics = sample_rubricator(question, rollouts)
-  valid = filter_by_corr_and_std(rubrics, rollouts.correctness, alpha)
-  r_cot = normalize(sum(score * satisfy for valid rubrics))
-  r_reasoner = r_outcome + r_cot
-  r_rubricator = fraction_valid + format_reward
-update_policy(r_reasoner, r_rubricator)
+Algorithm RLCER_TRAIN_BATCH(batch, N, alpha)
+Input:
+  batch = training questions
+  N = number of sampled rollouts per question
+  alpha = minimum rubric-correctness correlation
+Output:
+  updated shared policy with role conditioning
+
+FOR each question q IN batch DO
+  rollouts <- SAMPLE_REASONER(q, N)
+  correctness_labels <- FINAL_ANSWER_CORRECTNESS(rollouts)      # binary vector over rollouts
+  candidates <- SAMPLE_RUBRICATOR(q, rollouts)
+  valid_rubrics <- []
+
+  FOR each rubric (criterion_text, criterion_weight) IN candidates DO
+    satisfaction <- VERIFY_SATISFACTION(criterion_text, rollouts)      # satisfaction[i] in {0, 1}
+    correlation <- CORRELATION(satisfaction, correctness_labels)
+    IF correlation > alpha AND STD(satisfaction) > 0 THEN
+      ADD (criterion_text, criterion_weight, satisfaction) TO valid_rubrics
+    END IF
+  END FOR
+
+  FOR each rollout i DO
+    process_reward(i) <- SUM over valid_rubrics of criterion_weight * satisfaction[i]
+  END FOR
+
+  normalized_process_reward <- MIN_MAX_NORMALIZE(process_reward)
+  outcome_reward <- OUTCOME_REWARD(rollouts)
+  reasoner_reward <- outcome_reward + normalized_process_reward
+  rubricator_reward <- FRACTION_VALID(candidates, valid_rubrics) + FORMAT_REWARD(candidates)
+
+  UPDATE_SHARED_POLICY(role = "reasoner", rewards = reasoner_reward)
+  UPDATE_SHARED_POLICY(role = "rubricator", rewards = rubricator_reward)
+END FOR
 ```
+
+**Instruction-flow diagram (RLCER):**
+```text
+Training question q
+    |
+    v
+Sample N reasoner rollouts
+    |
+    v
+Compute final-answer correctness labels
+    |
+    v
+Rubricator proposes candidate rubrics
+    |
+    v
+Verifier checks rubric satisfaction for each rollout
+    |
+    v
+Measure correlation with correctness labels
+    |
+    +--> invalid or trivial rubric -> discard
+    |
+    `--> valid rubric -> keep
+                |
+                v
+Aggregate valid rubric satisfaction into process reward
+                |
+                v
+Normalize process reward and add outcome reward
+                |
+                +--> update reasoner
+                |
+                `--> update rubricator
+```
+
+![RLCER_TRAIN_BATCH workflow diagram](./meta/RLCER_TRAIN_BATCH.png)
 
 **Where this is discussed:**
 - Report: `deep-research-report.md` -> `## Paper summaries, examples, and pseudocode` (RLCER block)
@@ -127,7 +189,7 @@ update_policy(r_reasoner, r_rubricator)
 
 **Rubric (proper definition):**
 - A rubric is an explicit, checkable criterion about reasoning quality, paired with a score, used to evaluate whether a chain-of-thought trace satisfies that criterion.
-- Formally, a rubric can be represented as `(c_k, s_k)` where `c_k` is the criterion text and `s_k` is its reward weight; a verifier outputs `v_i(c_k) in {0,1}` for rollout `i`.
+- Formally, a rubric can be represented as `(criterion_text_k, criterion_weight_k)` where `criterion_text_k` is the criterion text and `criterion_weight_k` is its reward weight; a verifier outputs `satisfaction_i(criterion_text_k) in {0,1}` for rollout `i`.
 
 **Major concept A: Valid rubric filtering**
 - Rubric is useful only if it predicts correctness and is non-trivial.
@@ -141,30 +203,20 @@ update_policy(r_reasoner, r_rubricator)
 ## Slide 5: Paper 1 - Formulas
 
 **Formula 1 (validity condition):**
-- `valid(c) = [corr(v(c), y) > alpha] AND [std(v(c)) > 0]`
+- `is_valid(criterion_text) = [corr(satisfaction(criterion_text), correctness_labels) > alpha] AND [std(satisfaction(criterion_text)) > 0]`
 - English explanation: a rubric is kept only if its satisfaction pattern positively tracks correctness (`corr > alpha`) and it is not trivial (`std > 0` means not always 0 or always 1).
 
 **Formula 2 (CoT (Chain of Thought) reward before normalization):**
-- `r_cot(i) = sum_k s_k * v_i(c_k) * 1[valid(c_k)]`
-- English explanation: for rollout `i`, add rubric scores `s_k` only when rubric `k` is both valid and satisfied. Invalid or unsatisfied rubrics contribute zero.
+- `process_reward(i) = sum_k criterion_weight_k * satisfaction_i(criterion_text_k) * 1[is_valid(criterion_text_k)]`
+- English explanation: for rollout `i`, add rubric weights only when rubric `k` is both valid and satisfied. Invalid or unsatisfied rubrics contribute zero.
 
 **Formula 3 (min-max normalization):**
-- `r'_cot(i) = (r_cot(i) - min r_cot) / (max r_cot - min r_cot)`
-- English explanation: rescale raw CoT rewards to a stable `[0,1]` range so process reward has comparable magnitude across batches.
+- `normalized_process_reward(i) = (process_reward(i) - min process_reward) / (max process_reward - min process_reward)`
+- English explanation: rescale raw process rewards to a stable `[0,1]` range so process reward has comparable magnitude across batches.
 
 **Formula 4 (reasoner reward):**
-- `r_reasoner(i) = r_outcome(i) + r'_cot(i)`
-- English explanation: final training signal combines answer correctness (`r_outcome`) and reasoning quality (`r'_cot`) for the same rollout.
-
-**Code snippet (RLCER validity + reward):**
-```python
-corr = pearson_binary(rubric_satisfaction, correct_as_binary)
-is_valid = (corr > alpha) and (len(set(rubric_satisfaction)) > 1)
-
-r_cot = sum(score[k] for k in rubrics if is_valid and satisfied[k])
-r_cot_norm = (r_cot - min_r) / (max_r - min_r) if max_r > min_r else 0.0
-r_reasoner = r_outcome + r_cot_norm
-```
+- `reasoner_reward(i) = outcome_reward(i) + normalized_process_reward(i)`
+- English explanation: final training signal combines answer correctness (`outcome_reward`) and reasoning quality (`normalized_process_reward`) for the same rollout.
 
 **Script reference:** `scripts/01_rlcer_validity.py`
 
@@ -174,6 +226,14 @@ r_reasoner = r_outcome + r_cot_norm
 - Aligns with current interest in process supervision over outcome-only supervision.
 - Useful for math/coding/reasoning models where final correctness is verifiable.
 - Fits current trend: improve reasoning quality without full human process annotation.
+
+**Interesting findings from the actual paper:**
+- The paper first shows that self-proposed rubrics can provide useful supervision even without outcome reward, which is a stronger claim than "rubrics slightly help RLVR."
+- On the 8B model, RLCER beats RLVR on several benchmarks, including `AIME2024: 34.79 -> 37.50`, `AIME2025: 32.50 -> 33.33`, `AMC2023: 84.53 -> 86.41`, and `GPQA-Diamond: 46.56 -> 48.77`.
+- Gains also transfer beyond pure math training data, for example `SuperGPQA-Sci: 48.81 -> 50.25`, which is interesting because the RL data are math-heavy but the benefits are not purely math-local.
+- A subtle mechanism result: as rubrics self-evolve, their correlation with correctness rises, but the CoT reward becomes harder to earn; this suggests the rubricator is not just becoming easier to satisfy, but more selective.
+- The generated rubrics also help at inference time as prompt hints, and best-of-N with `N = 16` improves further, which makes the rubrics pedagogically useful, not only useful for training.
+- Main limitation stated by the authors: the rubricator increases rollout cost, and the paper does not yet establish effectiveness in non-verifiable domains.
 
 ---
 
@@ -204,14 +264,65 @@ r_reasoner = r_outcome + r_cot_norm
 5. Return safe/unsafe verdict.
 
 ```text
-F = decompose_intent(I)
-vals = {}
-for f in F:
-  vals[f] = deterministic_parse(f, tau) or llm_extract(f, I, tau)
-spec = synthesize_spec(vals)
-verdict = verify_with_z3(spec)
-return verdict
+Algorithm FORMALJUDGE_CHECK(intent I, trajectory tau)
+Input:
+  I = user intent / requirements
+  tau = agent plan or trajectory
+Output:
+  verdict, failed_constraints, extracted_facts
+
+F <- DECOMPOSE_INTO_ATOMIC_FACTS(I)
+vals <- empty map
+
+FOR each fact f IN F DO
+  IF HAS_DETERMINISTIC_PARSER(f, tau) THEN
+    vals[f] <- DETERMINISTIC_PARSE(f, tau)
+  ELSE
+    vals[f] <- LLM_EXTRACT(f, I, tau)
+  END IF
+END FOR
+
+constraints <- SYNTHESIZE_CONSTRAINTS(I, vals)
+Phi_safe <- CONJOIN(constraints)
+(verdict, failed_constraints) <- VERIFY_WITH_DAFNY_Z3(Phi_safe, vals)
+
+IF verdict = SAFE THEN
+  RETURN SAFE, {}, vals
+ELSE
+  repair_trace <- BUILD_FAILURE_TRACE(failed_constraints, vals)
+  RETURN UNSAFE, repair_trace, vals
+END IF
 ```
+
+**Instruction-flow diagram (FormalJudge):**
+```text
+User intent + agent trajectory
+            |
+            v
+Decompose intent into atomic facts / constraints
+            |
+            v
+Extract fact values from the trajectory
+            |
+            +--> structured field -> deterministic parser
+            |
+            `--> semantic field -> LLM extractor
+                        |
+                        v
+Synthesize formal specification
+            |
+            v
+Compile constraints into Dafny / SMT form
+            |
+            v
+Verify with Z3
+            |
+            +--> SAFE   -> return verdict and facts
+            |
+            `--> UNSAFE -> return failed constraints and repair trace
+```
+
+![FORMALJUDGE_CHECK workflow diagram](./meta/FORMALJUDGE_CHECK.png)
 
 **What is Z3 (quick explanation):**
 - Z3 is an SMT (Satisfiability Modulo Theories) solver from Microsoft Research.
@@ -271,15 +382,6 @@ return verdict
 - Theory solvers (for integer arithmetic, equality, etc.) validate those assignments.
 - Conflicts are learned and reused until either a consistent model is found or unsat is proven.
 
-**Code snippet (formal constraints in Python/Z3 style):**
-```python
-c_budget = total_cost <= budget
-c_dates = Implies(has_flight, checkin_day == arrival_day)
-
-Phi_safe = And(c_budget, c_dates)
-verdict = 1 if is_true(Phi_safe) else 0
-```
-
 **Script reference:** `scripts/03_formal_judge_lite.py`
 
 ## Slide 11: Paper 2 - NLP Relevance
@@ -289,6 +391,15 @@ verdict = 1 if is_true(Phi_safe) else 0
 - Matches current shift to neuro-symbolic pipelines in high-stakes applications.
 - Complements LangGraph pipelines by adding a formal verifier layer for graph node outputs and final decisions.
 - Practical lesson for NLP systems: keep semantics neural, keep constraint composition formal.
+
+**Interesting findings from the actual paper:**
+- The headline empirical result is an average `+16.6%` improvement over LLM-as-a-Judge baselines across 3 benchmarks and 7 agent models.
+- The Deceivers benchmark is especially striking: detection jumps from `62.47 -> 91.96` on GPT-4o agent traces and from `63.21 -> 94.16` on Qwen-72B traces, showing that the benefit is not a small calibration tweak.
+- The weak-to-strong result is one of the most memorable claims: a `7B` judge still achieves over `90%` accuracy detecting deception from `72B` agents.
+- A counterintuitive result from the paper: the hardest failures are often the subtle `L1/L2` ones, while `L3/L4` deceptions can be easier because elaborate deception leaves more traceable evidence.
+- Iterative formal feedback is not just diagnostic; it is corrective. Claude-4.5-Opus improves from `70.7%` to `99.8%` after three Dafny-guided rounds, and Qwen-14B improves from `34.3%` to `74.2%`.
+- The ablation story is also useful for teaching: structured inputs and Python checks both help, but they still fall clearly short of formal verification because executable checks are not proofs.
+- Main limitation stated by the authors: the remaining errors come mostly from the neural parts of the pipeline, especially decomposing intent into atomic constraints and extracting semantic facts from trajectories.
 
 ---
 
@@ -362,15 +473,68 @@ verdict = 1 if is_true(Phi_safe) else 0
 6. Read final posterior for target query.
 
 ```text
-lf = grammar_compile(disambiguate(text))
-G = build_factor_graph(lf, rules)  # AND/OR/NEG
-initialize_beliefs(G, evidence)
-repeat until converged:
-  pass_pi_messages(G)
-  pass_lambda_messages(G)
-  apply_damping(G)
-return posterior(query)
+Algorithm LOGICAL_IR_INFERENCE(text, KB, evidence E, query q)
+Input:
+  text = natural-language query or sentence
+  KB = logical rules / compiled knowledge
+  E = observed evidence
+  q = target proposition
+Output:
+  P(q), P(not q), derivation trace
+
+d <- DISAMBIGUATE(text)
+lf <- GRAMMAR_COMPILE(d)
+G <- BUILD_QUERY_RELEVANT_FACTOR_GRAPH(lf, KB)
+ADD_AND_OR_NEG_FACTORS(G)
+CLAMP_EVIDENCE(G, E)
+INITIALIZE_UNKNOWN_BELIEFS(G, 0.5)
+
+REPEAT
+  old_beliefs <- SNAPSHOT_BELIEFS(G)
+  PASS_FORWARD_PI_MESSAGES(G)
+  PASS_BACKWARD_LAMBDA_MESSAGES(G)
+  APPLY_NEGATION_CONSTRAINTS(G)
+  DAMP_BELIEFS(G, rho)
+UNTIL MAX_BELIEF_CHANGE(G, old_beliefs) < epsilon
+
+RETURN POSTERIOR(G, q), POSTERIOR(G, NOT q), TRACE_SUPPORT(G, q)
 ```
+
+**Instruction-flow diagram (Logical IR / LBN):**
+```text
+Natural-language text / query
+            |
+            v
+Local ambiguity resolution
+            |
+            v
+Grammar-first deterministic compilation
+            |
+            v
+Typed logical form
+            |
+            v
+Build query-relevant factor graph
+            |
+            +--> AND factors
+            +--> OR factors
+            `--> NEG factors
+                    |
+                    v
+Clamp observed evidence and initialize unknown beliefs
+                    |
+                    v
+Belief propagation loop
+    forward pi messages
+        -> backward lambda messages
+        -> negation consistency
+        -> damping
+                    |
+                    v
+Converged posterior beliefs + derivation trace
+```
+
+![LOGICAL_IR_INFERENCE workflow diagram](./meta/LOGICAL_IR_INFERENCE.png)
 
 **Where this is discussed:**
 - Report: `deep-research-report.md` -> `## Paper summaries, examples, and pseudocode` (Logical IR block)
@@ -405,18 +569,6 @@ return posterior(query)
 - From strong `A -> B` and evidence `not B`, posterior should reduce `P(A)` and raise `P(not A)`.
 - English explanation: if `A` usually causes `B`, then observing `not B` is evidence against `A`. This is the probabilistic version of modus tollens and is enabled by explicit negation handling.
 
-**Code snippet (noisy-OR + damping + NEG intuition):**
-```python
-# noisy_or = 1 - product(1 - message_j)
-belief_p = 1.0 - math.prod([(1.0 - m) for m in incoming_msgs])
-
-# damping update
-belief_new = damp * belief_old + (1 - damp) * belief_msg
-
-# NEG complementarity
-belief_not_p = 1.0 - belief_p
-```
-
 **Script reference:** `scripts/06_bp_logical_graph.py`, `scripts/07_neg_factor_ablation.py`
 
 ## Slide 18: Paper 3 - NLP Relevance
@@ -426,6 +578,15 @@ belief_not_p = 1.0 - belief_p
 - Supports hybrid systems: LLM (Large Language Model) for ambiguity resolution, symbolic layer for guaranteed structure.
 - Can be embedded as a reasoning node inside LangGraph workflows when you need inspectable probabilistic logic instead of free-form intermediate text.
 - Aligns with current demand for explainable, auditable NLP in enterprise and safety settings.
+
+**Interesting findings from the actual paper:**
+- The inference engine passes `44/44` tests across `22` reasoning categories, and the paper reports that most belief-propagation runs converge in `2-3` iterations, with all tests converging within `20` iterations using damping `0.5`.
+- The key technical upgrade is not just "negation exists"; the NEG factor enables contrapositive reasoning (`modus tollens`), which the earlier AND/OR-only system could not do.
+- The grammar experiment is unusually clean: `33/33` sentences parsed, `33/33` gold facts derived, `0` ambiguous parses, and `0` extra facts on disambiguated input.
+- The paper gives a sharp division of labor for LLMs: they are very good at local disambiguation, for example PP attachment is `95%` for GPT-4 versus `50%` for the Stanford parser on the ambiguous set.
+- But LLMs are poor exact parsers when asked to emit full structured output directly: GPT-4o gets only `12.4%` UAS and `7.9%` LAS in zero-shot dependency parsing, despite decent POS accuracy.
+- A very teachable asymmetry: unguided parse critique is only `50%`, but targeted critique of a known ambiguous construction is `95%`, which supports the paper's claim that LLMs work better as local analyzers than as full formal parsers.
+- The paper's broader conceptual claim is also worth mentioning aloud: it frames this architecture as a "bitter lesson" update, where LLMs supply the annotation/disambiguation labor and the formal system supplies the exact reasoning.
 
 **Paper 2 vs Paper 3 (quick comparison):**
 
@@ -476,16 +637,78 @@ belief_not_p = 1.0 - belief_p
 5. Anneal auxiliary PARL terms and keep task performance as final objective.
 
 ```text
-pi = joint_pretrain_text_vision(data, ratio)
-pi = text_only_sft(pi)  # zero-vision SFT
-pi = joint_multimodal_rl(pi, tasks)
+Algorithm KIMI_K25_TRAIN(pretrain_data, sft_data, rl_tasks, agentic_tasks)
+Input:
+  mixed text-vision corpora and downstream agentic tasks
+Output:
+  multimodal backbone pi and PARL orchestrator omega
 
-for task in agentic_tasks:
-  traj = orchestrator_run(task, frozen_subagents)
-  r = lambda1*r_parallel(traj) + lambda2*r_finish(traj) + r_perf(task, traj)
-  update_orchestrator(r)
-anneal(lambda1, lambda2 -> 0)
+pi <- JOINT_TEXT_VISION_PRETRAIN(pretrain_data, vision_ratio = moderate)
+pi <- TEXT_ONLY_SFT(pi, sft_data)                  # zero-vision SFT
+pi <- JOINT_MULTIMODAL_RL(pi, rl_tasks)
+
+FREEZE_SPECIALIZED_SUBAGENTS(pi)
+omega <- INITIALIZE_ORCHESTRATOR()
+SET lambda1, lambda2 TO initial shaping weights
+
+FOR each task x IN agentic_tasks DO
+  plan <- omega.DECIDE_DECOMPOSITION(x)
+  traj <- RUN_SUBAGENTS_IN_PARALLEL(plan)
+  r_parallel <- MEASURE_PARALLELISM(traj)
+  r_finish <- MEASURE_COMPLETION(traj)
+  critical_steps <- COMPUTE_CRITICAL_STEPS(traj)
+  r_perf <- TASK_QUALITY(x, traj) - beta * critical_steps
+  r_total <- lambda1 * r_parallel + lambda2 * r_finish + r_perf
+  UPDATE_ORCHESTRATOR(omega, traj, r_total)
+  ANNEAL(lambda1, lambda2 -> 0)
+END FOR
+
+RETURN pi, omega
 ```
+
+**Instruction-flow diagram (Kimi K2.5 / Agent Swarm):**
+```text
+Mixed text-vision pretraining data
+            |
+            v
+Joint text-vision pretraining
+            |
+            v
+Zero-vision SFT
+            |
+            v
+Joint multimodal RL
+            |
+            v
+Freeze specialist subagents
+            |
+            v
+Agentic task x arrives
+            |
+            v
+Orchestrator decides decomposition plan
+            |
+            v
+Spawn parallel subagents
+            |
+            v
+Run subtasks concurrently and collect outputs
+            |
+            v
+Compute:
+  - parallelism reward
+  - subtask-finish reward
+  - task-performance reward
+  - critical-step cost
+            |
+            v
+Update orchestrator policy
+            |
+            v
+Anneal auxiliary PARL weights toward zero
+```
+
+![KIMI_K25_TRAIN workflow diagram](./meta/KIMI_K25_TRAIN.png)
 
 **Where this is discussed:**
 - Report: `deep-research-report.md` -> Paper D (`2602.02276v1` block)
@@ -529,6 +752,15 @@ anneal(lambda1, lambda2 -> 0)
 - Practical pattern for production agents: train decomposition policy separately from specialist executors.
 - Connects reliability with scalability: better reasoning quality plus lower wall-clock latency.
 - Useful bridge from NLP systems to broader "general agentic intelligence" pipelines.
+
+**Interesting findings from the actual paper:**
+- A surprising pretraining result is that early vision fusion with a lower ratio works better than late heavy fusion under the same token budget; the `10%:90%` early setup beats the `50%:50%` late setup across the reported averages.
+- Zero-vision SFT is one of the paper's most interesting ideas: text-only SFT is enough to activate visual tool use, while the authors report that adding visual SFT trajectories in preliminary experiments actually hurt visual-agentic performance.
+- Visual RL improves text benchmarks instead of hurting them: `MMLU-Pro: 84.7 -> 86.4`, `GPQA-Diamond: 84.3 -> 86.4`, and `LongBench v2: 56.7 -> 58.9`.
+- Agent Swarm gives both quality and latency gains: `BrowseComp: 60.6 -> 78.4` and `WideSearch: 72.7 -> 79.0`, while also reaching target WideSearch quality about `3x` to `4.5x` faster than the single-agent baseline.
+- The PARL reward is designed around two concrete failure modes that are great to teach: `serial collapse` (never parallelize) and `spurious parallelism` (spawn many useless subagents just to game the metric).
+- The critical-steps metric is more meaningful than counting all subagent work; it rewards shortening the longest parallel branch rather than simply doing more work at once.
+- Beyond methodology, the model posts strong frontier results too, including `HLE-Full w/ tools = 50.2`, which the paper reports as above `GPT-5.2 = 45.5` and `Gemini 3 Pro = 45.8`.
 
 ---
 
